@@ -2,6 +2,7 @@ from flask import Flask, request, Response
 from flask_cors import CORS
 import requests
 import json
+import re
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": "*"}})
@@ -14,6 +15,13 @@ def process_thinking_content(message_content, thinking_started):
     """Process content based on thinking tags state"""
     if not message_content:
         return "", thinking_started
+
+    # First clean up markdown code blocks
+    if '```' in message_content:
+        # Extract content between ```json and ``` if it exists
+        json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', message_content, re.DOTALL)
+        if json_match:
+            message_content = json_match.group(1).strip()
 
     # Handle opening tag
     if '<think>' in message_content:
@@ -41,17 +49,52 @@ def is_empty_content(message_content):
         return True
     return not message_content.strip()
 
+def clean_response_content(content):
+    """Clean thinking tags from response content"""
+    if not content:
+        return content
+        
+    # Remove everything between <think> and </think> tags
+    while '<think>' in content and '</think>' in content:
+        start = content.find('<think>')
+        end = content.find('</think>') + len('</think>')
+        content = content[:start] + content[end:]
+    
+    # Clean up excessive newlines
+    content = '\n'.join(filter(None, content.split('\n')))
+    return content.strip()
+
 @app.route('/api/<path:path>', methods=['POST'])
 def proxy_api(path):
     if path not in ['generate', 'chat']:
         return Response('Not Found', status=404)
 
+    # Get request data
+    request_data = request.json
+    is_streaming = request_data.get('stream', True)
+
+    # Make request to Ollama
     response = requests.post(
         f"{OLLAMA_SERVER}/api/{path}",
-        json=request.json,
-        stream=True
+        json=request_data,
+        stream=is_streaming
     )
 
+    # Handle non-streaming response
+    if not is_streaming:
+        try:
+            data = response.json()
+            if 'response' in data:
+                data['response'] = clean_response_content(data['response'])
+            return Response(
+                json.dumps(data),
+                mimetype='application/json'
+            )
+        except Exception as e:
+            print(f"Error processing non-streaming response: {e}")
+            return Response(response.content, response.status_code)
+
+    # Handle streaming response
     def generate():
         thinking_started = False
         for chunk in response.iter_lines():
@@ -72,11 +115,6 @@ def proxy_api(path):
                         # Skip if content is empty after processing
                         if is_empty_content(cleaned_content):
                             continue
-                            
-                        # Clean up excessive newlines
-                        #cleaned_content = '\n'.join(filter(None, cleaned_content.split('\n')))
-                        #if not cleaned_content:
-                        #    continue
                             
                         # Update the content in the data
                         data['message']['content'] = cleaned_content
